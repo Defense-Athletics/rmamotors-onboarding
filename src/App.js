@@ -8,7 +8,7 @@ const DB2 = "https://rma-motors-onboarding-default-rtdb.us-central1.firebasedata
 // Bump this number every time you deploy a new build. After deploying, a manager
 // clicks "Publish update" in the dashboard, which writes this value to Firebase.
 // Clients running an older version then see a "refresh" banner.
-const BUILD_VERSION = 63;
+const BUILD_VERSION = 66;
 const META = "https://rma-motors-onboarding-default-rtdb.firebaseio.com/meta";
 const META2 = "https://rma-motors-onboarding-default-rtdb.us-central1.firebasedatabase.app/meta";
 
@@ -580,6 +580,7 @@ export default function App() {
   const [loginError, setLoginError] = useState(false);
   const [loginLoading, setLoginLoading] = useState(false);
   const [activeTab, setActiveTab] = useState("home");
+  const [pendingDeepLink, setPendingDeepLink] = useState(null); // { quiz: "ppf" } — honoured after login
   const [mgmtSetters, setMgmtSetters] = useState([]);
   const [mgmtLoading, setMgmtLoading] = useState(false);
   const [mgmtTab, setMgmtTab] = useState("overview");
@@ -608,6 +609,7 @@ export default function App() {
   const [newName, setNewName] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [newRole, setNewRole] = useState("setter"); // Role assigned at account creation
+  const [newAllowedQuizzes, setNewAllowedQuizzes] = useState([]); // For assessment_only accounts
   const [newEmail, setNewEmail] = useState(""); // Optional email for announcements
   const [genPassword, setGenPassword] = useState("");
   const [genLink, setGenLink] = useState("");
@@ -676,6 +678,13 @@ export default function App() {
     style.textContent = G;
     document.head.appendChild(style);
     const hash = window.location.hash.replace("#","");
+    // Deep link: #quiz=<id> — record for after login, then route normally
+    const quizMatch = hash.match(/^quiz=([a-z0-9_-]+)$/i);
+    if (quizMatch) {
+      setPendingDeepLink({ quiz: quizMatch[1].toLowerCase() });
+      setScreen("login");
+      return;
+    }
     if (hash === "mgmt") { setScreen("mgmt"); return; }
     if (hash?.startsWith("setter") || hash === "login" || hash === "") { setScreen("login"); }
     else { setScreen("mgmt"); }
@@ -742,7 +751,10 @@ export default function App() {
       setLoginError(false);
       const id = result._key;
       setSetterId(id);
-      setSetterData(result);
+      // Stamp lastLogin (ISO). Fire-and-forget so login isn't blocked if it fails.
+      const nowIso = new Date().toISOString();
+      sSet(id, { ...result, lastLogin: nowIso }).catch(()=>{});
+      setSetterData({ ...result, lastLogin: nowIso });
       // Closers default to their own (closer) view on login; setters always view setter.
       const initialView = result.role || "setter";
       setViewRole(initialView);
@@ -752,6 +764,21 @@ export default function App() {
       setQuizBlocked(initialProgress.quizBlocked||{});
       if (result.role) { setRole(result.role); setScreen("setter"); }
       else setScreen("role_select");
+      // Honour a deep link (e.g. #quiz=ppf) — jump to the Assessments tab and
+      // open the correct role-scoped quiz for this person.
+      if (pendingDeepLink?.quiz && result.role) {
+        const role = result.role;
+        // Generic ids the link may use ("ppf", "rtts") are mapped to the person's
+        // role-scoped quiz id. Exact ids are also honoured if valid for that role.
+        const bank = role === "closer" ? CLOSER_QUIZZES : QUIZZES;
+        const generic = { ppf: role === "closer" ? "closer_ppf" : "ppf" };
+        const targetId = bank[pendingDeepLink.quiz] ? pendingDeepLink.quiz : generic[pendingDeepLink.quiz];
+        if (targetId && bank[targetId]) {
+          setActiveTab("assessments");
+          setActiveQuiz(targetId);
+        }
+        setPendingDeepLink(null);
+      }
     } catch(e) {
       setLoginLoading(false);
       setLoginError("error: " + e.message);
@@ -834,12 +861,14 @@ export default function App() {
       email: newEmail.trim().toLowerCase(),
       startDate: new Date().toISOString().split("T")[0],
       role: newRole,
+      ...(newRole === "assessment_only" ? { allowedQuizzes: [...newAllowedQuizzes] } : {}),
       completedModules:[], quizScores:{}, quizAnswers:{}, feedback:[], setterId:id
     };
     await sSet(id, setterRecord);
     const url = `${window.location.href.split("#")[0]}#login`;
     setGenLink(url);
     setGenPassword(newPassword.trim());
+    setNewAllowedQuizzes([]);
     loadMgmt();
   };
 
@@ -929,17 +958,47 @@ export default function App() {
 
   // Active content depends on the VIEW (which a Closer can toggle).
   // The manager-dashboard helpers below depend on the user's PRIMARY role.
-  const activeModules = viewRole==="closer" ? CLOSER_MODULES : MODULES;
-  const activeQuizzes = viewRole==="closer" ? CLOSER_QUIZZES : QUIZZES;
+  // For an assessment_only user, pick out just the quizzes assigned to them
+  // from BOTH banks (a specialist could sit any subset).
+  const ALL_QUIZZES = { ...QUIZZES, ...CLOSER_QUIZZES };
+  const isAssessmentOnly = (r) => r === "assessment_only";
+  const quizzesFor = (data) => {
+    if (isAssessmentOnly(data?.role)) {
+      const allowed = data.allowedQuizzes || [];
+      const out = {};
+      allowed.forEach(k => { if (ALL_QUIZZES[k]) out[k] = ALL_QUIZZES[k]; });
+      return out;
+    }
+    return data?.role === "closer" ? CLOSER_QUIZZES : QUIZZES;
+  };
+  const activeModules = isAssessmentOnly(role) ? [] : (viewRole==="closer" ? CLOSER_MODULES : MODULES);
+  const activeQuizzes = isAssessmentOnly(role) ? quizzesFor(setterData) : (viewRole==="closer" ? CLOSER_QUIZZES : QUIZZES);
   const activeProgress = getProgress(setterData, viewRole);
-  const safeModuleCount = (s) => s?.role==="closer" ? CLOSER_MODULES.length : MODULES.length;
-  const completionPct = (d) => { if (!d) return 0; const mods = d.role==="closer" ? CLOSER_MODULES : MODULES; const qzs = d.role==="closer" ? CLOSER_QUIZZES : QUIZZES; const total = mods.length + Object.keys(qzs).length; return total > 0 ? Math.round(((d.completedModules?.length||0)+Object.keys(d.quizScores||{}).length)/total*100) : 0; };
+  const safeModuleCount = (s) => isAssessmentOnly(s?.role) ? 0 : (s?.role==="closer" ? CLOSER_MODULES.length : MODULES.length);
+  const completionPct = (d) => {
+    if (!d) return 0;
+    if (isAssessmentOnly(d.role)) {
+      // Quizzes only — completion = passed quizzes / assigned quizzes
+      const qzs = quizzesFor(d);
+      const total = Object.keys(qzs).length;
+      if (total === 0) return 0;
+      const pass = passMarkForRole(d.role);
+      const passed = Object.entries(d.quizScores||{}).filter(([k,v])=>qzs[k] && v>=pass).length;
+      return Math.round((passed/total)*100);
+    }
+    const mods = d.role==="closer" ? CLOSER_MODULES : MODULES;
+    const qzs = d.role==="closer" ? CLOSER_QUIZZES : QUIZZES;
+    const total = mods.length + Object.keys(qzs).length;
+    return total > 0 ? Math.round(((d.completedModules?.length||0)+Object.keys(d.quizScores||{}).length)/total*100) : 0;
+  };
   const avgScore = (d) => { const s = Object.values(d?.quizScores||{}); return s.length ? Math.round(s.reduce((a,b)=>a+b,0)/s.length) : null; };
   // Pass mark: both Closers and Setters must score 100%.
   const PASS_MARK_CLOSER = 100;
   const PASS_MARK_SETTER = 100;
   const passMarkForView = (view) => view === "closer" ? PASS_MARK_CLOSER : PASS_MARK_SETTER;
   const passMarkForRole = (r) => r === "closer" ? PASS_MARK_CLOSER : PASS_MARK_SETTER;
+  // assessment_only accounts use the same 100% bar
+  const PASS_MARK_ASSESSMENT_ONLY = 100;
   // Pass mark for the view currently being used in the staff app
   const PASS = passMarkForView(viewRole);
   const isUnlocked = (mod, done=[]) => {
@@ -1058,7 +1117,8 @@ export default function App() {
   );
 
   if (screen==="mgmt" && mgmtAuth) {
-    const avgComp = mgmtSetters.length ? Math.round(mgmtSetters.reduce((a,s)=>a+completionPct(s),0)/mgmtSetters.length) : 0;
+    const onboardingStaff = mgmtSetters.filter(s => s.role !== "assessment_only");
+    const avgComp = onboardingStaff.length ? Math.round(onboardingStaff.reduce((a,s)=>a+completionPct(s),0)/onboardingStaff.length) : 0;
     const passed = mgmtSetters.reduce((total, s) => total + Object.values(s.quizScores||{}).filter(score=>score>=passMarkForRole(s.role)).length, 0);
     return (
       <>
@@ -1086,6 +1146,17 @@ export default function App() {
         const subject = announceAssessment
           ? `New assessment added: ${announceAssessment}`
           : "New assessment added to your training platform";
+        // If the assessment name looks like a known quiz, generate a direct deep
+        // link that logs the person in and drops them on that quiz. Otherwise fall
+        // back to the plain platform URL.
+        const platformBase = window.location.href.split("#")[0];
+        const deepLinkFor = (name) => {
+          const n = (name||"").toLowerCase();
+          if (n.includes("ppf") || n.includes("upsell") || n.includes("upsale")) return `${platformBase}#quiz=ppf`;
+          if (n.includes("road to the sale") || n.includes("rtts")) return `${platformBase}#quiz=rtts`;
+          return null;
+        };
+        const directLink = deepLinkFor(announceAssessment);
         const bodyLines = [
           `Hi team,`,
           ``,
@@ -1095,13 +1166,14 @@ export default function App() {
           ``,
           `Please log in and complete it${announceDeadline ? ` by ${announceDeadline}` : " at your earliest convenience"}.`,
           ``,
-          `Platform: ${window.location.href.split("#")[0]}`,
+          directLink ? `Direct link (opens the assessment after you log in):` : `Platform:`,
+          directLink || platformBase,
           ``,
           `A reminder that the pass mark for all assessments is 100%. Review the relevant module and SOP thoroughly before attempting. You have 3 attempts before the assessment locks — after which a manager must unlock it.`,
           ``,
           `Any questions, come and find me.`,
           ``,
-          `Thanks,`,
+          `Warm regards,`,
           `Management`,
         ];
         const body = bodyLines.join("\n");
@@ -1195,34 +1267,58 @@ export default function App() {
             <div style={{ fontSize:15, fontWeight:700, marginBottom:6, color:T.text }}>Create a new staff account</div>
             <div style={{ fontSize:13, color:T.muted, marginBottom:"1.25rem", lineHeight:1.65 }}>Choose the role, enter their name, and set a password. Send them the unique link and password — they will need both to sign in.</div>
             <label style={{ fontSize:11, fontWeight:700, color:T.faint, display:"block", marginBottom:6, textTransform:"uppercase", letterSpacing:"0.1em" }}>Assigned role</label>
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:14 }}>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:8, marginBottom:14 }}>
               {[
                 { r:"setter", label:"Setter", icon:"⚡", desc:"Inbound leads, appointment setting" },
                 { r:"closer", label:"Closer", icon:"🤝", desc:"Appointments, deposit, handover · Elite" },
+                { r:"assessment_only", label:"Assessment only", icon:"📝", desc:"Sits specific quizzes only. No modules or SOPs." },
               ].map(({r, label, icon, desc})=>{
                 const selected = newRole === r;
-                const accent = r === "closer" ? T.purple : T.gold;
-                const accentBg = r === "closer" ? T.purpleBg : T.goldBg;
+                const accent = r === "closer" ? T.purple : r === "assessment_only" ? T.blue : T.gold;
+                const accentBg = r === "closer" ? T.purpleBg : r === "assessment_only" ? T.blueBg : T.goldBg;
+                const accentTx = r === "closer" ? T.purpleTx : r === "assessment_only" ? T.blueTx : T.gold;
                 return (
                   <button key={r} type="button" onClick={()=>setNewRole(r)}
                     style={{ background:selected?accentBg:T.surf, border:`1px solid ${selected?accent:T.border}`, borderRadius:10, padding:"12px 14px", cursor:"pointer", textAlign:"left", fontFamily:"'DM Sans',system-ui,sans-serif", transition:"all .15s" }}>
                     <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:3 }}>
                       <span style={{ fontSize:16 }}>{icon}</span>
                       <span style={{ fontSize:13, fontWeight:700, color:T.text }}>{label}</span>
-                      {selected && <span style={{ fontSize:10, fontWeight:700, marginLeft:"auto", color:r==="closer"?T.purpleTx:T.gold }}>✓ Selected</span>}
+                      {selected && <span style={{ fontSize:10, fontWeight:700, marginLeft:"auto", color:accentTx }}>✓</span>}
                     </div>
                     <div style={{ fontSize:11, color:T.muted, lineHeight:1.45 }}>{desc}</div>
                   </button>
                 );
               })}
             </div>
-            <label style={{ fontSize:11, fontWeight:700, color:T.faint, display:"block", marginBottom:6, textTransform:"uppercase", letterSpacing:"0.1em" }}>{newRole==="closer"?"Closer's":"Setter's"} full name</label>
+            {newRole === "assessment_only" && (
+              <>
+                <label style={{ fontSize:11, fontWeight:700, color:T.faint, display:"block", marginBottom:6, textTransform:"uppercase", letterSpacing:"0.1em" }}>Assigned assessments</label>
+                <div style={{ background:T.surf, border:`1px solid ${T.border}`, borderRadius:10, padding:"10px 12px", marginBottom:14, maxHeight:220, overflow:"auto" }}>
+                  {[
+                    ["Setter assessments", QUIZZES],
+                    ["Closer assessments", CLOSER_QUIZZES],
+                  ].map(([heading, bank]) => (
+                    <div key={heading} style={{ marginBottom:8 }}>
+                      <div style={{ fontSize:10, fontWeight:700, color:T.faint, textTransform:"uppercase", letterSpacing:"0.06em", marginBottom:6 }}>{heading}</div>
+                      {Object.entries(bank).map(([k,q]) => (
+                        <label key={k} style={{ display:"flex", alignItems:"center", gap:8, padding:"5px 0", fontSize:12, color:T.text, cursor:"pointer" }}>
+                          <input type="checkbox" checked={newAllowedQuizzes.includes(k)}
+                            onChange={()=>setNewAllowedQuizzes(prev => prev.includes(k) ? prev.filter(x=>x!==k) : [...prev, k])} />
+                          <span>{q.icon} {q.label}</span>
+                        </label>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+            <label style={{ fontSize:11, fontWeight:700, color:T.faint, display:"block", marginBottom:6, textTransform:"uppercase", letterSpacing:"0.1em" }}>{newRole==="closer"?"Closer's":newRole==="assessment_only"?"Person's":"Setter's"} full name</label>
             <Input value={newName} onChange={e=>setNewName(e.target.value)} placeholder="e.g. Alex Mitchell" style={{ marginBottom:10 }} />
             <label style={{ fontSize:11, fontWeight:700, color:T.faint, display:"block", marginBottom:6, textTransform:"uppercase", letterSpacing:"0.1em" }}>Email address <span style={{ color:T.faint, fontWeight:500, textTransform:"none", letterSpacing:0, fontSize:10 }}>· optional, used for announcements</span></label>
             <Input type="email" value={newEmail} onChange={e=>setNewEmail(e.target.value)} placeholder="e.g. alex.mitchell@rmamotors.ae" style={{ marginBottom:10 }} />
             <label style={{ fontSize:11, fontWeight:700, color:T.faint, display:"block", marginBottom:6, textTransform:"uppercase", letterSpacing:"0.1em" }}>Set their password</label>
             <Input value={newPassword} onChange={e=>setNewPassword(e.target.value)} placeholder="e.g. RMA2024Alex" style={{ marginBottom:14 }} />
-            <Btn primary small onClick={generateLink} disabled={!newName.trim()||!newPassword.trim()}>Create {newRole==="closer"?"Closer":"Setter"} account →</Btn>
+            <Btn primary small onClick={generateLink} disabled={!newName.trim()||!newPassword.trim()||(newRole==="assessment_only" && newAllowedQuizzes.length===0)}>Create {newRole==="closer"?"Closer":newRole==="assessment_only"?"assessment-only":"Setter"} account →</Btn>
             {genLink && (
               <div style={{ marginTop:14, background:T.surf, borderRadius:10, padding:"14px 16px", border:`1px solid ${T.border}` }}>
                 <div style={{ fontSize:11, fontWeight:700, color:T.greenTx, marginBottom:10 }}>✓ {newRole==="closer"?"Closer":"Setter"} account created — share these details with {newName}</div>
@@ -1240,7 +1336,7 @@ export default function App() {
         ) : (
           <>
             <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))", gap:10, marginBottom:"1.75rem" }}>
-              {[["Active setters",mgmtSetters.filter(s=>s.role!=="closer").length],["Active closers",mgmtSetters.filter(s=>s.role==="closer").length],["Avg completion",`${avgComp}%`],["Quizzes passed",`${passed}`,],["Shop floor ready",mgmtSetters.filter(s=>completionPct(s)>=90).length]].map(([l,v])=>(
+              {[["Active setters",mgmtSetters.filter(s=>s.role!=="closer" && s.role!=="assessment_only").length],["Active closers",mgmtSetters.filter(s=>s.role==="closer").length],["Assessment-only",mgmtSetters.filter(s=>s.role==="assessment_only").length],["Avg completion",`${avgComp}%`],["Quizzes passed",`${passed}`,],["Shop floor ready",mgmtSetters.filter(s=>s.role!=="assessment_only" && completionPct(s)>=90).length]].map(([l,v])=>(
                 <div key={l} style={{ background:T.surf, borderRadius:10, padding:"1rem", border:`1px solid ${T.border}` }}>
                   <div style={{ fontSize:10, fontWeight:700, color:T.faint, marginBottom:4, textTransform:"uppercase", letterSpacing:"0.06em" }}>{l}</div>
                   <div style={{ fontSize:24, fontWeight:800, color:T.text }}>{v}</div>
@@ -1265,9 +1361,16 @@ export default function App() {
                         <div style={{ flex:1, minWidth:100 }}>
                           <div style={{ display:"flex", alignItems:"center", gap:6 }}>
                             <div style={{ fontSize:13, fontWeight:700, color:T.text }}>{s.name}</div>
-                            {s.role && <span style={{ fontSize:9, fontWeight:700, padding:"2px 6px", borderRadius:99, background:s.role==="closer"?T.purpleBg:T.goldBg, color:s.role==="closer"?T.purpleTx:T.gold, textTransform:"uppercase" }}>{s.role}</span>}
+                            {s.role==="assessment_only"
+                              ? <span style={{ fontSize:9, fontWeight:700, padding:"2px 6px", borderRadius:99, background:T.blueBg, color:T.blueTx, textTransform:"uppercase" }}>Assessment only</span>
+                              : s.role && <span style={{ fontSize:9, fontWeight:700, padding:"2px 6px", borderRadius:99, background:s.role==="closer"?T.purpleBg:T.goldBg, color:s.role==="closer"?T.purpleTx:T.gold, textTransform:"uppercase" }}>{s.role}</span>}
                           </div>
-                          <div style={{ fontSize:11, color:T.muted }}>Started {s.startDate} · {s.completedModules?.length||0}/{safeModuleCount(s)} modules</div>
+                          <div style={{ fontSize:11, color:T.muted }}>
+                            Started {s.startDate}
+                            {s.role==="assessment_only"
+                              ? ` · ${(s.allowedQuizzes||[]).length} assessment${(s.allowedQuizzes||[]).length===1?"":"s"} assigned`
+                              : ` · ${s.completedModules?.length||0}/${safeModuleCount(s)} modules`}
+                          </div>
                         </div>
                         {hasLocked && (
                           <span style={{ fontSize:11, fontWeight:700, padding:"3px 10px", borderRadius:99, background:T.redBg, color:T.redTx }}>
@@ -1345,6 +1448,34 @@ export default function App() {
                                 <div style={{ fontSize:13, fontWeight:600, color:s.email?T.text:T.faint, fontFamily:s.email?"monospace":"inherit" }}>{s.email || "— not on file"}</div>
                               )}
                             </div>
+                            {(() => {
+                              const ll = s.lastLogin;
+                              let display = "Never logged in";
+                              let colour = T.faint;
+                              if (ll) {
+                                const then = new Date(ll);
+                                const now = new Date();
+                                const diffMs = now - then;
+                                const mins = Math.floor(diffMs / 60000);
+                                const hours = Math.floor(mins / 60);
+                                const days = Math.floor(hours / 24);
+                                if (mins < 1) display = "Just now";
+                                else if (mins < 60) display = `${mins} min${mins===1?"":"s"} ago`;
+                                else if (hours < 24) display = `${hours} hour${hours===1?"":"s"} ago`;
+                                else if (days < 7) display = `${days} day${days===1?"":"s"} ago`;
+                                else display = then.toLocaleDateString("en-GB", { day:"2-digit", month:"short", year:"numeric" });
+                                // Colour: green ≤24h, amber ≤7d, red >7d
+                                colour = hours < 24 ? T.greenTx : days < 7 ? T.amberTx : T.redTx;
+                                const stamp = then.toLocaleString("en-GB", { day:"2-digit", month:"short", year:"numeric", hour:"2-digit", minute:"2-digit" });
+                                display = `${display}  ·  ${stamp}`;
+                              }
+                              return (
+                                <div style={{ background:T.surf, borderRadius:8, padding:"8px 12px", gridColumn:"span 2" }}>
+                                  <div style={{ fontSize:10, fontWeight:700, color:T.faint, marginBottom:3, textTransform:"uppercase", letterSpacing:"0.08em" }}>Last active</div>
+                                  <div style={{ fontSize:13, fontWeight:600, color:colour }}>{display}</div>
+                                </div>
+                              );
+                            })()}
                           </div>
                           <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap", padding:"10px 12px", background:s.role==="closer"?T.purpleBg:T.goldBg, border:`1px solid ${s.role==="closer"?T.purple:T.gold}`, borderRadius:10, marginBottom:10 }}>
                             <span style={{ fontSize:11, fontWeight:700, color:s.role==="closer"?T.purpleTx:T.gold, textTransform:"uppercase", letterSpacing:"0.06em" }}>
@@ -1462,6 +1593,125 @@ export default function App() {
   const totalItems = viewRole==="closer" ? (CLOSER_MODULES.length + Object.keys(CLOSER_QUIZZES).length) : (MODULES.length + Object.keys(QUIZZES).length);
   const doneItems = (activeProgress.completedModules?.length||0)+Object.keys(activeProgress.quizScores||{}).length;
   const pct = totalItems > 0 ? Math.round((doneItems/totalItems)*100) : 0;
+
+  // Stripped-down page for assessment-only accounts: no tabs, no modules, no
+  // SOPs — just the assigned quizzes. Reuses activeQuizzes (which for this
+  // role type is the filter of allowedQuizzes) and the same activeProgress.
+  if (role === "assessment_only") {
+    const assignedIds = Object.keys(activeQuizzes);
+    const validQuizId = activeQuizzes[activeQuiz] ? activeQuiz : assignedIds[0];
+    if (assignedIds.length > 0 && validQuizId !== activeQuiz) { setActiveQuiz(validQuizId); }
+    const quiz = activeQuizzes[validQuizId];
+    const total = quiz?.questions?.length || 0;
+    const savedScore = activeProgress.quizScores?.[validQuizId];
+    return (
+      <>
+      {updateBanner}
+      <div style={{ background:T.bg, minHeight:"100vh", padding:"1.5rem 2rem" }} className="fade">
+        <div style={{ maxWidth:900, margin:"0 auto" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:14, paddingBottom:"1.25rem", borderBottom:`1px solid ${T.border}`, marginBottom:"1.5rem", flexWrap:"wrap" }}>
+            <RMALogo size={20} />
+            <div style={{ width:1, height:20, background:T.border, flexShrink:0 }} />
+            <div style={{ fontSize:12, color:T.muted, fontWeight:600 }}>Assessments</div>
+            <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:10 }}>
+              <span style={{ fontSize:11, fontWeight:700, padding:"4px 10px", borderRadius:99, background:T.blueBg, color:T.blueTx }}>📝 Assessment access</span>
+              <Avatar initials={setterData?.initials} size={30} />
+              <span style={{ fontSize:11, fontWeight:700, color:T.faint }}>{setterData?.name?.split(" ")[0]?.toUpperCase()}</span>
+            </div>
+          </div>
+          <div style={{ background:`linear-gradient(135deg,${T.card},#1E2335)`, borderRadius:14, border:`1px solid ${T.border}`, padding:"1.25rem 1.5rem", marginBottom:"1.5rem" }}>
+            <div style={{ fontSize:18, fontWeight:800, color:T.text, marginBottom:2 }}>Hi {setterData?.name?.split(" ")[0]} — here are your assessments.</div>
+            <div style={{ fontSize:12, color:T.muted, lineHeight:1.55 }}>Pass mark is 100%. You have 3 attempts before an assessment locks. Review the material carefully before starting.</div>
+          </div>
+          {assignedIds.length === 0 ? (
+            <Card><div style={{ padding:"1rem", fontSize:13, color:T.muted, textAlign:"center" }}>No assessments have been assigned to your account yet. Please contact your manager.</div></Card>
+          ) : (
+            <>
+              <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:"1rem" }}>
+                {Object.entries(activeQuizzes).map(([id,q])=>{
+                  const score = activeProgress.quizScores?.[id];
+                  return (
+                    <button key={id} className={`sub-tab ${activeQuiz===id?"active":""}`} onClick={()=>{ setActiveQuiz(id); setQuizAnswers(activeProgress.quizAnswers||{}); }}>
+                      {q.icon} {q.label}
+                      {quizBlocked[id] && <span style={{ marginLeft:6, fontSize:10, color:T.redTx, fontWeight:800 }}>🔒</span>}
+                      {!quizBlocked[id] && score!==undefined && <span style={{ marginLeft:6, fontSize:10, color:score>=PASS?T.greenTx:T.redTx, fontWeight:800 }}>({score}%)</span>}
+                    </button>
+                  );
+                })}
+              </div>
+              {quiz && (() => {
+                const allDone = quizAnswers && Array.from({length:total},(_,i)=>quizAnswers[`${validQuizId}-${i}`]).every(Boolean);
+                const displayScore = allDone ? Math.round((quiz.questions.filter((_,i)=>quizAnswers[`${validQuizId}-${i}`]?.correct).length/total)*100) : null;
+                return (
+                  <div>
+                    <div style={{ background:T.surf, borderRadius:12, padding:"1rem 1.25rem", marginBottom:12, border:`1px solid ${T.border}`, display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:8 }}>
+                      <div style={{ fontSize:14, fontWeight:700, color:T.text }}>{quiz.icon} {quiz.label}</div>
+                      {savedScore!==undefined && <span style={{ fontSize:12, fontWeight:700, color:savedScore>=PASS?T.greenTx:T.redTx }}>{savedScore>=PASS?"✓":"✗"} Best score: {savedScore}%</span>}
+                    </div>
+                    {quizBlocked[validQuizId] ? (
+                      <div style={{ padding:"1.5rem", borderRadius:14, textAlign:"center", background:T.redBg, border:`1px solid ${T.red}` }}>
+                        <div style={{ fontSize:16, fontWeight:800, color:T.redTx, marginBottom:6 }}>🔒 Assessment locked</div>
+                        <div style={{ fontSize:12, color:T.muted, lineHeight:1.55 }}>You've used all 3 attempts. Your manager must unlock this before you can retake.</div>
+                      </div>
+                    ) : quiz.questions.map((q,qi)=>{
+                      const key = `${validQuizId}-${qi}`, ans = quizAnswers[key];
+                      const opts = getShuffledOpts(validQuizId, qi, q.opts);
+                      return (
+                        <div key={qi} style={{ background:T.surf, borderRadius:12, padding:"1rem 1.25rem", marginBottom:10, border:`1px solid ${T.border}` }}>
+                          <div style={{ fontSize:13, fontWeight:700, color:T.text, marginBottom:10 }}>{qi+1}. {q.q}</div>
+                          {opts.map(({txt, origIdx})=>{
+                            let bg=T.bg, bd=T.border, tc=T.text;
+                            if (ans!==undefined) {
+                              if (ans.correct && origIdx===q.correct) { bg=T.greenBg; bd=T.green; tc=T.greenTx; }
+                              else if (!ans.correct && origIdx===ans.chosen) { bg=T.redBg; bd=T.red; tc=T.redTx; }
+                            }
+                            return (
+                              <button key={origIdx} onClick={()=>handleQuizAnswer(qi, origIdx)} disabled={ans!==undefined}
+                                style={{ display:"block", width:"100%", textAlign:"left", padding:"9px 12px", marginBottom:6, background:bg, color:tc, border:`1px solid ${bd}`, borderRadius:8, cursor:ans!==undefined?"default":"pointer", fontSize:12, fontFamily:"'DM Sans',system-ui,sans-serif" }}>{txt}</button>
+                            );
+                          })}
+                          {ans!==undefined && (
+                            <div style={{ fontSize:12, padding:"9px 12px", borderRadius:8, marginTop:8, background:ans.correct?T.greenBg:T.redBg, border:`1px solid ${ans.correct?T.green:T.red}`, color:ans.correct?T.greenTx:T.redTx, lineHeight:1.55 }}>
+                              {ans.correct
+                                ? <><strong>✓ Correct!</strong></>
+                                : <><strong>✗ Incorrect.</strong> Review the training material provided by your manager and retake.</>}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {allDone && displayScore!==null && !quizBlocked[validQuizId] && (
+                      <div style={{ padding:"1.5rem", borderRadius:14, textAlign:"center", background:displayScore>=PASS?T.greenBg:T.amberBg, border:`1px solid ${displayScore>=PASS?T.green:T.amber}`, marginTop:10 }}>
+                        <div style={{ fontSize:28, fontWeight:800, color:displayScore>=PASS?T.greenTx:T.amberTx }}>{displayScore}%</div>
+                        <div style={{ fontSize:13, color:displayScore>=PASS?T.greenTx:T.amberTx }}>{quiz.questions.filter((_,i)=>quizAnswers[`${validQuizId}-${i}`]?.correct).length}/{total} correct · pass mark {PASS}%</div>
+                        <div style={{ fontSize:12, color:T.muted, marginTop:6 }}>
+                          {displayScore>=PASS ? "✓ Passed — your score has been saved."
+                          : `✗ Below ${PASS}% — review the material and retake. Attempts remaining: ${3-(quizAttempts[validQuizId]||0)}.`}
+                        </div>
+                      </div>
+                    )}
+                    {allDone && !quizBlocked[validQuizId] && displayScore < PASS && (
+                      <div style={{ marginTop:10 }}><Btn small primary onClick={async ()=>{
+                        setQuizAnswers({});
+                        setShuffledOpts({});
+                        if (setterData) {
+                          const prog = getProgress(setterData, viewRole);
+                          const cleanedAnswers = Object.fromEntries(Object.entries(prog.quizAnswers||{}).filter(([k])=>!k.startsWith(`${validQuizId}-`)));
+                          const updated = writeProgress(setterData, viewRole, { quizAnswers: cleanedAnswers });
+                          await saveData(updated);
+                        }
+                      }}>Retake quiz</Btn></div>
+                    )}
+                  </div>
+                );
+              })()}
+            </>
+          )}
+        </div>
+      </div>
+      </>
+    );
+  }
 
   return (
     <>
